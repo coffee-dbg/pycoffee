@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from .monitoring import Monitoring
+from .repl import REPL
 
 _logger = logging.getLogger(__name__)
 
@@ -34,8 +35,8 @@ class DBG:
         sys.path[0] = str(self.script_path.parent)
         sys.argv[:] = self.script_args
 
-        monitoring = Monitoring()
-        monitoring.register_start(lambda *args: print(args))
+        repl = REPL()
+        monitoring = Monitoring(repl)
 
         with monitoring(code):
             exec(code, globals_)

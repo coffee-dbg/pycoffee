@@ -1,5 +1,11 @@
+from __future__ import annotations
+
 import sys
+import typing
 from types import CodeType
+
+if typing.TYPE_CHECKING:
+    from .repl import REPL
 
 MONITORING = sys.monitoring
 EVENTS = sys.monitoring.events
@@ -10,8 +16,10 @@ TOOL_NAME = 'PYCOFFEE_TOOL'
 class Monitoring:
     """Class API to use `sys.monitoring`"""
 
-    def __init__(self):
-        self.callbacks = {}
+    def __init__(self, repl: REPL):
+        self.callbacks = {
+            EVENTS.PY_START: repl.run
+        }
         self.code = None
 
     def __call__(self, code: CodeType):
@@ -32,6 +40,3 @@ class Monitoring:
         MONITORING.free_tool_id(TOOL_ID)
         self.code = None
         return False       
-
-    def register_start(self, callback):
-        self.callbacks[EVENTS.PY_START] = callback
