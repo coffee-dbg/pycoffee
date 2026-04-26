@@ -1,3 +1,4 @@
+import linecache
 import logging
 import sys
 import sysconfig
@@ -5,6 +6,7 @@ from multiprocessing import Process, Pipe
 from types import CodeType
 from pathlib import Path
 
+from .cmd import REPL_CMD, SCRIPT_CMD
 from .repl import REPL
 
 STD_LIB = Path(sysconfig.get_paths()['stdlib'])
@@ -62,22 +64,39 @@ def _run_cmd(script_conn, cmd: str):
 
     MONITORING.use_tool_id(TOOL_ID, TOOL_NAME)
     MONITORING.register_callback(TOOL_ID, EVENTS.PY_START, callback_py_start)
+    MONITORING.register_callback(TOOL_ID, EVENTS.LINE, callback_line)
     MONITORING.set_events(TOOL_ID, EVENTS.PY_START)
     try:
-        while True:
-            exec(code, globals_)
+        exec(code, globals_)
     finally:
         MONITORING.free_tool_id(TOOL_ID)  # Unregister callbacks
+        CONN.send((REPL_CMD.EXIT, ()))
 
 
-def callback_py_start(code: CodeType, instruction_offset):
+def callback_py_start(code: CodeType, instruction_offset: int):
     filename = Path(code.co_filename)
-
     if filename.is_relative_to(STD_LIB) or str(filename).startswith('<'):
         return
 
-    print(filename)
+    MONITORING.set_local_events(TOOL_ID, code, EVENTS.LINE)
 
-    CONN.send('py_start signal')
-    cmd = CONN.recv()
-    print(cmd)
+
+def callback_line(code: CodeType, line_number: int):
+    MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
+
+    while True:
+        CONN.send(('',))
+        cmd, *args = CONN.recv()
+
+        match cmd:
+            case SCRIPT_CMD.EXIT:
+                sys.exit(0)
+            case SCRIPT_CMD.CONTINUE:
+                break
+            case SCRIPT_CMD.STEP_OVER:
+                MONITORING.set_local_events(TOOL_ID, code, EVENTS.LINE)
+                break
+            case SCRIPT_CMD.LINE:
+                filename = code.co_filename
+                line = linecache.getline(filename, line_number).rstrip()
+                print(f'{filename}:{line_number} -> {line}')
