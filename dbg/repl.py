@@ -16,17 +16,18 @@ class REPL:
             match cmd:
                 case REPL_CMD.EXIT:
                     return
-
-            user_input = input('(dbg) ').strip()
-            match user_input:
-                case 'q':
-                    self.conn.send((SCRIPT_CMD.EXIT, ()))
-                    return
-                case 'c':
-                    self.conn.send((SCRIPT_CMD.CONTINUE, ()))
-                case 's':
-                    self.conn.send((SCRIPT_CMD.STEP_OVER, ()))
-                case 'line':
-                    self.conn.send((SCRIPT_CMD.LINE, ()))
-                case _:
-                    # TODO make expression evaluation
+                case REPL_CMD.INTERACTION:
+                    user_input = input('(dbg) ').strip()
+                    match user_input:
+                        case 'q':
+                            self.conn.send((SCRIPT_CMD.EXIT, ()))
+                            return
+                        case 'c':
+                            self.conn.send((SCRIPT_CMD.CONTINUE, ()))
+                        case 's':
+                            self.conn.send((SCRIPT_CMD.STEP_OVER, ()))
+                        case 'line':
+                            self.conn.send((SCRIPT_CMD.LINE, ()))
+                        case _:
+                            # TODO make expression evaluation
+                            pass

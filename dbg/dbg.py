@@ -85,7 +85,7 @@ def callback_line(code: CodeType, line_number: int):
     MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
 
     while True:
-        CONN.send(('',))
+        CONN.send((REPL_CMD.INTERACTION, ()))
         cmd, *args = CONN.recv()
 
         match cmd:

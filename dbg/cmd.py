@@ -12,3 +12,4 @@ class SCRIPT_CMD(IntEnum):
 
 class REPL_CMD(IntEnum):
     EXIT = auto()
+    INTERACTION = auto()
