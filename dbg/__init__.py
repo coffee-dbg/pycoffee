@@ -1,1 +1,1 @@
-from .dbg import DBG
+from .dbg import run_cmd

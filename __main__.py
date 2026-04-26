@@ -1,7 +1,7 @@
 import sys
 
-from dbg import DBG
+from dbg import run_cmd
 
 cmd = ' '.join(sys.argv[1:])
-DBG(cmd).run()
+run_cmd(cmd)
 
