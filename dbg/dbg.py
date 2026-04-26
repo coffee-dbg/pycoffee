@@ -151,6 +151,7 @@ def repl(code, line_number):
 
         match cmd:
             case SCRIPT_CMD.EXIT:
+                RUNNING_SCRIPT.set()
                 sys.exit(0)
             case SCRIPT_CMD.CONTINUE:
                 break
