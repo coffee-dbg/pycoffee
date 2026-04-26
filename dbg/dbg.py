@@ -119,9 +119,10 @@ def local_callback_call(code: CodeType, instruction_offset: int, callable: objec
 
 def local_callback_py_return(code: CodeType, instruction_offset: int, retval: object):
     MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
-    if not TRACKER[code]['step_out']:
+    if not (TRACKER[code]['step_out'] or TRACKER[code]['step_into']):
         return
     TRACKER[code]['step_out'] = False
+    TRACKER[code]['step_into'] = False
 
     caller_frame = sys._getframe(1).f_back
     TRACKER[caller_frame.f_code]['step_over'] = True
@@ -151,16 +152,17 @@ def repl(code, line_number):
                 TRACKER[code]['step_over'] = True
                 TRACKER[code]['step_into'] = True
                 MONITORING.set_local_events(TOOL_ID, code, EVENTS.CALL)
+                MONITORING.set_local_events(TOOL_ID, code, EVENTS.PY_RETURN)  # For example during `return`
                 break
             case SCRIPT_CMD.STEP_OUT:
                 TRACKER[code]['step_out'] = True
                 MONITORING.set_local_events(TOOL_ID, code, EVENTS.PY_RETURN)
                 break
             case SCRIPT_CMD.LINE:
-                filename = code.co_filename
                 line = linecache.getline(filename, line_number).rstrip()
                 print(f'{filename}:{line_number} -> {line}')
 
             case SCRIPT_CMD.ADD_BREAKPOINT:
                 line_number = args[0]
-                Breakpoint(code.co_filename, int(line_number))
+                Breakpoint(filename, int(line_number))
+                print('Breakpoint', filename, line_number)
