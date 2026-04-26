@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import sys
+import typing
 
 from .cmd import REPL_CMD, SCRIPT_CMD
+
+if typing.TYPE_CHECKING:
+    from multiprocessing.connection import Connection
 
 
 class REPL:
 
-    def __init__(self, conn):
+    def __init__(self, conn: Connection):
         self.conn = conn
 
     def run(self):
@@ -26,6 +29,10 @@ class REPL:
                             self.conn.send((SCRIPT_CMD.CONTINUE, ()))
                         case 's':
                             self.conn.send((SCRIPT_CMD.STEP_OVER, ()))
+                        case 'i':
+                            self.conn.send((SCRIPT_CMD.STEP_INTO, ()))
+                        case 'o':
+                            self.conn.send((SCRIPT_CMD.STEP_OUT, ()))
                         case 'line':
                             self.conn.send((SCRIPT_CMD.LINE, ()))
                         case _:
