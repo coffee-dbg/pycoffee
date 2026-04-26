@@ -22,8 +22,8 @@ TOOL_ID = 4  # sys.monitoring.DEBUGGER_ID
 TOOL_NAME = 'PYCOFFEE_TOOL'
 
 CONN: Connection = None
-RUNNING_EVENT = threading.Event()
-RUNNING_EVENT.set()
+RUNNING_SCRIPT = threading.Event()
+RUNNING_SCRIPT.set()
 
 _logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -91,6 +91,8 @@ TRACKER = defaultdict(lambda: {
 
 
 def global_callback_line(code: CodeType, line_number: int):
+    RUNNING_SCRIPT.wait()
+
     if TRACKER[code]['step_over'] or TRACKER[code]['step_into']:
         TRACKER[code]['step_over'] = False
         TRACKER[code]['step_into'] = False
@@ -101,6 +103,8 @@ def global_callback_line(code: CodeType, line_number: int):
 
 
 def local_callback_call(code: CodeType, instruction_offset: int, callable: object, arg0: object):
+    RUNNING_SCRIPT.wait()
+
     MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
     if not TRACKER[code]['step_into']:
         return
@@ -118,6 +122,8 @@ def local_callback_call(code: CodeType, instruction_offset: int, callable: objec
 
 
 def local_callback_py_return(code: CodeType, instruction_offset: int, retval: object):
+    RUNNING_SCRIPT.wait()
+
     MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
     if not (TRACKER[code]['step_out'] or TRACKER[code]['step_into']):
         return
@@ -129,6 +135,9 @@ def local_callback_py_return(code: CodeType, instruction_offset: int, retval: ob
 
 
 def repl(code, line_number):
+    # All threads will wait (if they trigger a monitoring callback; `EVENTS.LINE`)
+    RUNNING_SCRIPT.clear()
+
     filename = code.co_filename
 
     print(f'<{filename}:{line_number}>')
@@ -166,3 +175,5 @@ def repl(code, line_number):
                 line_number = args[0]
                 Breakpoint(filename, int(line_number))
                 print('Breakpoint', filename, line_number)
+
+    RUNNING_SCRIPT.set()
