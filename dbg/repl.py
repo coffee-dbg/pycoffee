@@ -21,20 +21,25 @@ class REPL:
                     return
                 case REPL_CMD.INTERACTION:
                     user_input = input('(dbg) ').strip()
-                    match user_input:
+                    user_cmd, *user_args = user_input.split(' ')
+                    match user_cmd:
                         case 'q':
-                            self.conn.send((SCRIPT_CMD.EXIT, ()))
+                            self.conn.send((SCRIPT_CMD.EXIT,))
                             return
                         case 'c':
-                            self.conn.send((SCRIPT_CMD.CONTINUE, ()))
+                            self.conn.send((SCRIPT_CMD.CONTINUE,))
                         case 's':
-                            self.conn.send((SCRIPT_CMD.STEP_OVER, ()))
+                            self.conn.send((SCRIPT_CMD.STEP_OVER,))
                         case 'i':
-                            self.conn.send((SCRIPT_CMD.STEP_INTO, ()))
+                            self.conn.send((SCRIPT_CMD.STEP_INTO,))
                         case 'o':
-                            self.conn.send((SCRIPT_CMD.STEP_OUT, ()))
+                            self.conn.send((SCRIPT_CMD.STEP_OUT,))
                         case 'line':
-                            self.conn.send((SCRIPT_CMD.LINE, ()))
+                            self.conn.send((SCRIPT_CMD.LINE,))
+
+                        case 'b':
+                            self.conn.send((SCRIPT_CMD.ADD_BREAKPOINT, *user_args))
+
                         case _:
                             # TODO make expression evaluation
                             pass

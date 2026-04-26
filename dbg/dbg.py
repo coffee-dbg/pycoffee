@@ -2,11 +2,14 @@ import linecache
 import logging
 import sys
 import sysconfig
+import threading
+from collections import defaultdict
 from multiprocessing import Process, Pipe
 from multiprocessing.connection import Connection
 from types import CodeType, FunctionType, MethodType
 from pathlib import Path
 
+from .breakpoint import Breakpoint
 from .cmd import REPL_CMD, SCRIPT_CMD
 from .repl import REPL
 
@@ -19,6 +22,8 @@ TOOL_ID = 4  # sys.monitoring.DEBUGGER_ID
 TOOL_NAME = 'PYCOFFEE_TOOL'
 
 CONN: Connection = None
+RUNNING_EVENT = threading.Event()
+RUNNING_EVENT.set()
 
 _logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -63,13 +68,14 @@ def _run_cmd(script_conn, cmd: str):
     sys.path[0] = str(script_path.parent)
     sys.argv[:] = script_args
 
+    repl(code, 0)
+
     MONITORING.use_tool_id(TOOL_ID, TOOL_NAME)
-    MONITORING.register_callback(TOOL_ID, EVENTS.PY_START, callback_py_start)
-    MONITORING.register_callback(TOOL_ID, EVENTS.LINE, callback_line)
-    MONITORING.register_callback(TOOL_ID, EVENTS.CALL, callback_call)
-    MONITORING.register_callback(TOOL_ID, EVENTS.PY_RETURN, callback_py_return)
-    MONITORING.set_events(TOOL_ID, EVENTS.PY_START)
-    MONITORING.set_local_events(TOOL_ID, code, EVENTS.LINE)  # First interaction
+    MONITORING.register_callback(TOOL_ID, EVENTS.LINE, global_callback_line)
+    MONITORING.register_callback(TOOL_ID, EVENTS.CALL, local_callback_call)
+    MONITORING.register_callback(TOOL_ID, EVENTS.PY_RETURN, local_callback_py_return)
+    MONITORING.set_events(TOOL_ID, EVENTS.LINE)
+
     try:
         exec(code, globals_)
     finally:
@@ -77,34 +83,57 @@ def _run_cmd(script_conn, cmd: str):
         CONN.send((REPL_CMD.EXIT, ()))
 
 
-def callback_py_start(code: CodeType, instruction_offset: int):
-    filename = Path(code.co_filename)
-    if filename.is_relative_to(STD_LIB) or str(filename).startswith('<'):
+TRACKER = defaultdict(lambda: {
+    'step_over': False,
+    'step_into': False,
+    'step_out': False,
+})
+
+
+def global_callback_line(code: CodeType, line_number: int):
+    if TRACKER[code]['step_over'] or TRACKER[code]['step_into']:
+        TRACKER[code]['step_over'] = False
+        TRACKER[code]['step_into'] = False
+        repl(code, line_number)
+
+    elif Breakpoint.registry.get((code.co_filename, line_number)):
+        repl(code, line_number)
+
+
+def local_callback_call(code: CodeType, instruction_offset: int, callable: object, arg0: object):
+    MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
+    if not TRACKER[code]['step_into']:
         return
+    TRACKER[code]['step_into'] = False
+    TRACKER[code]['step_over'] = False
 
-    if has_breakpoints(code):
-        MONITORING.set_local_events(TOOL_ID, code, EVENTS.LINE)
-
-
-def callback_call(code: CodeType, instruction_offset: int, callable: object, arg0: object):
     callee_code = None
     if isinstance(callable, FunctionType):
         callee_code = callable.__code__
-    if isinstance(callable, MethodType):
+    elif isinstance(callable, MethodType):
         callee_code = callable.__func__.__code__
 
     if callee_code:
-        MONITORING.set_local_events(TOOL_ID, callee_code, EVENTS.LINE)
+        TRACKER[callee_code]['step_over'] = True
 
 
-def callback_py_return(code: CodeType, instruction_offset: int, retval: object):
-    caller_frame = sys._getframe(1)
-    caller_code = caller_frame.f_code
-    MONITORING.set_local_events(TOOL_ID, caller_code, EVENTS.LINE)
-
-
-def callback_line(code: CodeType, line_number: int):
+def local_callback_py_return(code: CodeType, instruction_offset: int, retval: object):
     MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
+    if not TRACKER[code]['step_out']:
+        return
+    TRACKER[code]['step_out'] = False
+
+    caller_frame = sys._getframe(1).f_back
+    TRACKER[caller_frame.f_code]['step_over'] = True
+
+
+def repl(code, line_number):
+    filename = code.co_filename
+
+    print(f'<{filename}:{line_number}>')
+    line = linecache.getline(filename, line_number).rstrip()
+    if line:
+        print(line)
 
     while True:
         CONN.send((REPL_CMD.INTERACTION, ()))
@@ -116,12 +145,15 @@ def callback_line(code: CodeType, line_number: int):
             case SCRIPT_CMD.CONTINUE:
                 break
             case SCRIPT_CMD.STEP_OVER:
-                MONITORING.set_local_events(TOOL_ID, code, EVENTS.LINE)
+                TRACKER[code]['step_over'] = True
                 break
             case SCRIPT_CMD.STEP_INTO:
-                MONITORING.set_local_events(TOOL_ID, code, EVENTS.LINE | EVENTS.CALL)
+                TRACKER[code]['step_over'] = True
+                TRACKER[code]['step_into'] = True
+                MONITORING.set_local_events(TOOL_ID, code, EVENTS.CALL)
                 break
             case SCRIPT_CMD.STEP_OUT:
+                TRACKER[code]['step_out'] = True
                 MONITORING.set_local_events(TOOL_ID, code, EVENTS.PY_RETURN)
                 break
             case SCRIPT_CMD.LINE:
@@ -129,6 +161,6 @@ def callback_line(code: CodeType, line_number: int):
                 line = linecache.getline(filename, line_number).rstrip()
                 print(f'{filename}:{line_number} -> {line}')
 
-
-def has_breakpoints(code: CodeType):
-    return False
+            case SCRIPT_CMD.ADD_BREAKPOINT:
+                line_number = args[0]
+                Breakpoint(code.co_filename, int(line_number))

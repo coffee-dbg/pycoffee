@@ -9,6 +9,8 @@ class SCRIPT_CMD(IntEnum):
     STEP_OUT = auto()
     LINE = auto()
 
+    ADD_BREAKPOINT = auto()
+
 
 class REPL_CMD(IntEnum):
     EXIT = auto()
