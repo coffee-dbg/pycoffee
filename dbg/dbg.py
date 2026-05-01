@@ -1,5 +1,6 @@
-import linecache
+import contextlib
 import logging
+import os
 import shlex
 import sys
 import sysconfig
@@ -18,7 +19,10 @@ TOOL_ID = 4  # sys.monitoring.DEBUGGER_ID
 TOOL_NAME = 'PYCOFFEE_TOOL'
 
 RUNNING_SCRIPT = threading.Event()
-RUNNING_SCRIPT.set()
+RUNNING_SCRIPT.clear()
+RUNNING_DBG = threading.Event()
+RUNNING_DBG.set()
+TID_DBG = None
 
 _logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -27,6 +31,8 @@ logging.basicConfig(
 
 
 class DBG:
+
+    is_debugging: bool = True
 
     def __init__(self, cmd):
 
@@ -60,44 +66,54 @@ class DBG:
         sys.argv[:] = script_args
 
         self.thread_states = defaultdict(lambda: {
-            'step': False
+            'step_depth': False,
+            'depth': 0,
         })
 
-        self.repl()
+        self.current_tid = None
 
-        MONITORING.use_tool_id(TOOL_ID, TOOL_NAME)
-        MONITORING.register_callback(TOOL_ID, EVENTS.LINE, self.monitoring_callback)
-        MONITORING.set_events(TOOL_ID, EVENTS.LINE)
-        try:
+        dbg_thread = threading.Thread(target=self.repl, name='<DBG (REPL)>')
+        dbg_thread.start()
+
+        with self.monitoring():
             exec(code, globals_)
+
+        self.is_debugging = False
+        RUNNING_DBG.set()  # Give the last control to the debugger
+
+    @contextlib.contextmanager
+    def monitoring(self):
+        MONITORING.use_tool_id(TOOL_ID, TOOL_NAME)
+        MONITORING.register_callback(TOOL_ID, EVENTS.LINE, self.monitoring_callback_line)
+        MONITORING.register_callback(TOOL_ID, EVENTS.CALL, self.monitoring_callback_call)
+        MONITORING.register_callback(TOOL_ID, EVENTS.PY_RETURN, self.monitoring_callback_return)
+        MONITORING.set_events(TOOL_ID, EVENTS.LINE | EVENTS.CALL | EVENTS.PY_RETURN)
+        try:
+            yield
         finally:
-            MONITORING.free_tool_id(TOOL_ID)  # Unregister callbacks
+            MONITORING.set_events(TOOL_ID, 0)
+            MONITORING.free_tool_id(TOOL_ID)
+
+    def monitoring_callback_call(self, code: CodeType, instruction_offset: int, callable: object, arg0: object):
+        if ((tid := threading.get_ident()) == self.dbg_tid): return
+        RUNNING_SCRIPT.wait()
+        self.thread_states[tid]['depth'] += 1
+
+    def monitoring_callback_return(self, code: CodeType, instruction_offset: int, retval: object):
+        if ((tid := threading.get_ident()) == self.dbg_tid): return
+        RUNNING_SCRIPT.wait()
+        self.thread_states[tid]['depth'] -= 1
 
     def monitoring_callback_line(self, code: CodeType, line_number: int):
+        if ((tid := threading.get_ident()) == self.dbg_tid): return
         RUNNING_SCRIPT.wait()
 
-        tid = threading.get_ident()
-        thread_state = self.thread_states[tid]
-
-        if not thread_state['step']:
-            return
-        thread_state['step'] = False
-
-        RUNNING_SCRIPT.clear()
-
-        # If break
-        filename = code.co_filename
-        print(f'<{filename}:{line_number}>')
-        line = linecache.getline(filename, line_number).rstrip()
-        if line:
-            print(line)
-
-        self.repl()
-
-        RUNNING_SCRIPT.set()
-
     def repl(self):
+        self.dbg_tid = threading.get_ident()
+        print('Debug thread:', self.dbg_tid)
+
         while True:
+            RUNNING_DBG.wait()
             user_input = input('(☕︎) ').strip()
             if not user_input:
                 continue
@@ -119,8 +135,13 @@ class DBG:
 
             cmd_func(self, user_args)
 
+            if cmd_func._cmd_stop and self.is_debugging:
+                RUNNING_DBG.clear()
+                RUNNING_SCRIPT.set()
+                continue
+
     @staticmethod
-    def cmd(name: str, parser: ArgumentParser, alias: str | None = None):
+    def cmd(name: str, parser: ArgumentParser, alias: str | None = None, stop: bool = False):
         parser.prog = name
         parser.add_help = True
         parser.exit_on_error = False
@@ -135,17 +156,44 @@ class DBG:
             func._cmd_name = name
             func._cmd_parse = parser.parse_args
             func._cmd_alias = alias
+            func._cmd_stop = stop
             return func
         return wrapper
 
-    @cmd('step_over', ArgumentParser(), alias='s')
+    thread_parser = ArgumentParser()
+    thread_parser.add_argument('-l', '--list', action='store_true', help='List all active threads')
+
+    @cmd('thread', thread_parser, alias='t')
+    def _thread(self, args):
+        print(f'Thread:', threading.get_ident())
+        if args.list:
+            for t in threading.enumerate():
+                print(f'- name={t.name} | id={t.ident}')
+
+    @cmd('step_over', ArgumentParser(), alias='s', stop=True)
     def _step_over(self, args):
         print('step over')
+        thread_state = self.thread_states[self.current_tid]
+        thread_state['step_depth'] = thread_state['depth']
+        print(self.tid, thread_state['step_depth'])
 
-    @cmd('step_into', ArgumentParser(), alias='i')
+    @cmd('step_into', ArgumentParser(), alias='i', stop=True)
     def _step_into(self, args):
         print('step into')
+        thread_state = self.thread_states[self.current_tid]
+        thread_state['step_depth'] = thread_state['depth'] + 1
 
-    @cmd('step_out', ArgumentParser(), alias='o')
+    @cmd('step_out', ArgumentParser(), alias='o', stop=True)
     def _step_out(self, args):
         print('step out')
+        thread_state = self.thread_states[self.current_tid]
+        thread_state['step_depth'] = thread_state['depth'] - 1
+
+    @cmd('continue', ArgumentParser(), alias='c', stop=True)
+    def _continue(self, args):
+        print('continue')
+
+    @cmd('quit', ArgumentParser(), alias='q', stop=True)
+    def _quit(self, args):
+        print('quit')
+        os._exit(0)
