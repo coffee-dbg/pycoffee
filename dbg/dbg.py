@@ -1,17 +1,13 @@
 import linecache
 import logging
+import shlex
 import sys
 import sysconfig
 import threading
+from argparse import ArgumentError, ArgumentParser
 from collections import defaultdict
-from multiprocessing import Process, Pipe
-from multiprocessing.connection import Connection
-from types import CodeType, FunctionType, MethodType
+from types import CodeType
 from pathlib import Path
-
-from .breakpoint import Breakpoint
-from .cmd import REPL_CMD, SCRIPT_CMD
-from .repl import REPL
 
 STD_LIB = Path(sysconfig.get_paths()['stdlib'])
 
@@ -21,7 +17,6 @@ DISABLE = sys.monitoring.DISABLE
 TOOL_ID = 4  # sys.monitoring.DEBUGGER_ID
 TOOL_NAME = 'PYCOFFEE_TOOL'
 
-CONN: Connection = None
 RUNNING_SCRIPT = threading.Event()
 RUNNING_SCRIPT.set()
 
@@ -31,150 +26,126 @@ logging.basicConfig(
 )
 
 
-def run_cmd(cmd):
-    dbg_conn, script_conn = Pipe()
+class DBG:
 
-    global CONN
-    CONN = dbg_conn
+    def __init__(self, cmd):
 
-    script_process = Process(target=_run_cmd, args=(script_conn, cmd))
-    script_process.start()
+        # Register commands
+        self.cmds = {}
+        self.cmd_aliases = {}
+        for attr in filter(lambda attr: hasattr(attr, '_cmd'), vars(self.__class__).values()):
+            self.cmds[attr._cmd_name] = attr
+            if attr._cmd_alias is not None:
+                self.cmd_aliases[attr._cmd_alias] = attr
 
-    REPL(CONN).run()
+        script, *args = cmd.split()
+        script_path = Path(script).resolve()
+        script_args = [str(script_path), *args]
 
+        if not (script_path.is_file() and script_path.suffix == ".py"):
+            _logger.error(f'Uncorrect python path: {script_path}')
+            sys.exit(-1)
 
-def _run_cmd(script_conn, cmd: str):
-    global CONN
-    CONN = script_conn
+        with open(script_path, 'r') as file:
+            code = compile(file.read(), script_path, 'exec')
 
-    script, *args = cmd.split()
-    script_path = Path(script).resolve()
-    script_args = [str(script_path), *args]
+        globals_ = dict(
+            __name__='__main__',
+            __file__=str(script_path),
+            __builtins__=dict(__builtins__),
+            __spec__=None,
+        )
 
-    if not (script_path.is_file() and script_path.suffix == ".py"):
-        _logger.error(f'Uncorrect python path: {script_path}')
-        sys.exit(-1)
+        sys.path[0] = str(script_path.parent)
+        sys.argv[:] = script_args
 
-    with open(script_path, 'r') as file:
-        code = compile(file.read(), script_path, 'exec')
+        self.thread_states = defaultdict(lambda: {
+            'step': False
+        })
 
-    globals_ = dict(
-        __name__='__main__',
-        __file__=str(script_path),
-        __builtins__=dict(__builtins__),
-        __spec__=None,
-    )
+        self.repl()
 
-    sys.path[0] = str(script_path.parent)
-    sys.argv[:] = script_args
+        MONITORING.use_tool_id(TOOL_ID, TOOL_NAME)
+        MONITORING.register_callback(TOOL_ID, EVENTS.LINE, self.monitoring_callback)
+        MONITORING.set_events(TOOL_ID, EVENTS.LINE)
+        try:
+            exec(code, globals_)
+        finally:
+            MONITORING.free_tool_id(TOOL_ID)  # Unregister callbacks
 
-    repl(code, 0)
+    def monitoring_callback_line(self, code: CodeType, line_number: int):
+        RUNNING_SCRIPT.wait()
 
-    MONITORING.use_tool_id(TOOL_ID, TOOL_NAME)
-    MONITORING.register_callback(TOOL_ID, EVENTS.LINE, global_callback_line)
-    MONITORING.register_callback(TOOL_ID, EVENTS.CALL, local_callback_call)
-    MONITORING.register_callback(TOOL_ID, EVENTS.PY_RETURN, local_callback_py_return)
-    MONITORING.set_events(TOOL_ID, EVENTS.LINE)
+        tid = threading.get_ident()
+        thread_state = self.thread_states[tid]
 
-    try:
-        exec(code, globals_)
-    finally:
-        MONITORING.free_tool_id(TOOL_ID)  # Unregister callbacks
-        CONN.send((REPL_CMD.EXIT, ()))
+        if not thread_state['step']:
+            return
+        thread_state['step'] = False
 
+        RUNNING_SCRIPT.clear()
 
-TRACKER = defaultdict(lambda: {
-    'step_over': False,
-    'step_into': False,
-    'step_out': False,
-})
+        # If break
+        filename = code.co_filename
+        print(f'<{filename}:{line_number}>')
+        line = linecache.getline(filename, line_number).rstrip()
+        if line:
+            print(line)
 
+        self.repl()
 
-def global_callback_line(code: CodeType, line_number: int):
-    RUNNING_SCRIPT.wait()
+        RUNNING_SCRIPT.set()
 
-    if TRACKER[code]['step_over'] or TRACKER[code]['step_into']:
-        TRACKER[code]['step_over'] = False
-        TRACKER[code]['step_into'] = False
-        repl(code, line_number)
+    def repl(self):
+        while True:
+            user_input = input('(☕︎) ').strip()
+            if not user_input:
+                continue
+            user_cmd, *user_args = shlex.split(user_input)
 
-    elif Breakpoint.registry.get((code.co_filename, line_number)):
-        repl(code, line_number)
+            try:
+                cmd_func = self.cmd_aliases.get(user_cmd) or self.cmds[user_cmd]
+            except KeyError:
+                _logger.error(f'Unkown REPL command: {user_cmd}')
+                continue
 
+            try:
+                user_args = cmd_func._cmd_parse(user_args)
+            except ArgumentError as e:
+                _logger.error(e)
+                continue
+            except Exception:
+                continue
 
-def local_callback_call(code: CodeType, instruction_offset: int, callable: object, arg0: object):
-    RUNNING_SCRIPT.wait()
+            cmd_func(self, user_args)
 
-    MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
-    if not TRACKER[code]['step_into']:
-        return
-    TRACKER[code]['step_into'] = False
-    TRACKER[code]['step_over'] = False
+    @staticmethod
+    def cmd(name: str, parser: ArgumentParser, alias: str | None = None):
+        parser.prog = name
+        parser.add_help = True
+        parser.exit_on_error = False
 
-    callee_code = None
-    if isinstance(callable, FunctionType):
-        callee_code = callable.__code__
-    elif isinstance(callable, MethodType):
-        callee_code = callable.__func__.__code__
+        # Prevent parser to exit (during help)
+        def _parser_exit(*args, **kwargs):
+            raise Exception
+        parser.exit = _parser_exit
 
-    if callee_code:
-        TRACKER[callee_code]['step_over'] = True
+        def wrapper(func):
+            func._cmd = True
+            func._cmd_name = name
+            func._cmd_parse = parser.parse_args
+            func._cmd_alias = alias
+            return func
+        return wrapper
 
+    @cmd('step_over', ArgumentParser(), alias='s')
+    def _step_over(self, args):
+        print('step over')
 
-def local_callback_py_return(code: CodeType, instruction_offset: int, retval: object):
-    RUNNING_SCRIPT.wait()
+    @cmd('step_into', ArgumentParser(), alias='i')
+    def _step_into(self, args):
+        print('step into')
 
-    MONITORING.set_local_events(TOOL_ID, code, EVENTS.NO_EVENTS)
-    if not (TRACKER[code]['step_out'] or TRACKER[code]['step_into']):
-        return
-    TRACKER[code]['step_out'] = False
-    TRACKER[code]['step_into'] = False
-
-    caller_frame = sys._getframe(1).f_back
-    TRACKER[caller_frame.f_code]['step_over'] = True
-
-
-def repl(code, line_number):
-    # All threads will wait (if they trigger a monitoring callback; `EVENTS.LINE`)
-    RUNNING_SCRIPT.clear()
-
-    filename = code.co_filename
-
-    print(f'<{filename}:{line_number}>')
-    line = linecache.getline(filename, line_number).rstrip()
-    if line:
-        print(line)
-
-    while True:
-        CONN.send((REPL_CMD.INTERACTION, ()))
-        cmd, *args = CONN.recv()
-
-        match cmd:
-            case SCRIPT_CMD.EXIT:
-                RUNNING_SCRIPT.set()
-                sys.exit(0)
-            case SCRIPT_CMD.CONTINUE:
-                break
-            case SCRIPT_CMD.STEP_OVER:
-                TRACKER[code]['step_over'] = True
-                break
-            case SCRIPT_CMD.STEP_INTO:
-                TRACKER[code]['step_over'] = True
-                TRACKER[code]['step_into'] = True
-                MONITORING.set_local_events(TOOL_ID, code, EVENTS.CALL)
-                MONITORING.set_local_events(TOOL_ID, code, EVENTS.PY_RETURN)  # For example during `return`
-                break
-            case SCRIPT_CMD.STEP_OUT:
-                TRACKER[code]['step_out'] = True
-                MONITORING.set_local_events(TOOL_ID, code, EVENTS.PY_RETURN)
-                break
-            case SCRIPT_CMD.LINE:
-                line = linecache.getline(filename, line_number).rstrip()
-                print(f'{filename}:{line_number} -> {line}')
-
-            case SCRIPT_CMD.ADD_BREAKPOINT:
-                line_number = args[0]
-                Breakpoint(filename, int(line_number))
-                print('Breakpoint', filename, line_number)
-
-    RUNNING_SCRIPT.set()
+    @cmd('step_out', ArgumentParser(), alias='o')
+    def _step_out(self, args):
+        print('step out')
