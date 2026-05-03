@@ -4,14 +4,11 @@ import logging
 import os
 import shlex
 import sys
-import sysconfig
 import threading
 from argparse import ArgumentError, ArgumentParser
 from collections import defaultdict
 from types import CodeType, FrameType
 from pathlib import Path
-
-STD_LIB = Path(sysconfig.get_paths()['stdlib'])
 
 MONITORING = sys.monitoring
 EVENTS = sys.monitoring.events
@@ -20,14 +17,12 @@ TOOL_ID = 4  # sys.monitoring.DEBUGGER_ID
 TOOL_NAME = 'PYCOFFEE_TOOL'
 
 RUNNING_SCRIPT = threading.Event()
-RUNNING_SCRIPT.set()
 RUNNING_DBG = threading.Event()
-RUNNING_DBG.clear()
-TID_DBG = None
 
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger('☕︎')
 logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(message)s"
+    level=logging.INFO,
+    format='%(name)s: %(message)s'
 )
 
 
@@ -41,6 +36,7 @@ class Breakpoints:
     def add(self, filename: str, line_number: int | None = None):
         filename_breakpoints = self.breakpoints[filename]
         filename_breakpoints[line_number] = {}
+        _logger.info(f'Breakpoint added: {filename}, {line_number}')
 
     def get(self, filename: str, line_number: int) -> dict | None:
         filename_breakpoints = self.breakpoints[filename]
@@ -75,6 +71,10 @@ class ThreadState:
         self._frame = frame
         self._lineno = frame.f_lineno
 
+    @property
+    def filename(self):
+        return self._frame.f_code.co_filename
+
     def _step(self, mode: str):
         self._step_mode = mode
         self._step_frame = self._frame
@@ -107,9 +107,11 @@ class ThreadState:
         return stop
 
 
-class DBG:
+class _RestartException(Exception): ...
+class _QuitException(Exception): ...
 
-    is_debugging: bool = True
+
+class DBG:
 
     def __init__(self, cmd):
 
@@ -147,15 +149,41 @@ class DBG:
         dbg_thread = threading.Thread(target=self.repl, name='<DBG (REPL)>')
         dbg_thread.start()
 
-        # Add first breakpoint
-        self.breakpoints = Breakpoints()
-        self.breakpoints.add(code.co_filename)
+        self.flag_run = False
+        self.flag_restart = False
+        self.flag_quit = False
 
-        with self.monitoring():
-            exec(code, globals_)
+        while True:
 
-        self.is_debugging = False
-        RUNNING_DBG.set()  # Give the last control to the debugger
+            # Opportunity to set configuration from debugger REPL
+            while not self.flag_run:
+                self.selected_tid = None
+                RUNNING_DBG.set()
+                RUNNING_SCRIPT.clear()
+                RUNNING_SCRIPT.wait()
+                if self.flag_quit:
+                    _logger.info('Quit debugger')
+                    os._exit(1)
+
+            try:
+                # Add first breakpoint
+                self.breakpoints = Breakpoints()
+                self.breakpoints.add(code.co_filename)
+
+                _logger.info('Run program')
+                with self.monitoring():
+                    exec(code, globals_)
+                _logger.info('End program')
+
+                self.flag_run = False
+
+            except _RestartException:
+                _logger.info('Restart program')
+                self.flag_run = True
+                continue
+            except _QuitException:
+                _logger.info('Quit debugger')
+                os._exit(1)
 
     @contextlib.contextmanager
     def monitoring(self):
@@ -189,13 +217,21 @@ class DBG:
             RUNNING_DBG.set()
             RUNNING_SCRIPT.wait()  # To prevent next line of the debugged thread
 
+            # Check flags
+            if self.flag_restart:
+                self.flag_restart = False
+                raise _RestartException
+            if self.flag_quit:
+                self.flag_quit = False
+                raise _QuitException
+
     def repl(self):
         self.dbg_tid = threading.get_ident()
-        print('Debug thread:', self.dbg_tid)
+        _logger.info(f'Start debugger (thread: {self.dbg_tid})')
 
         while True:
             RUNNING_DBG.wait()
-            user_input = input('(☕︎) ').strip()
+            user_input = input('☕︎> ').strip()
             if not user_input:
                 continue
             user_cmd, *user_args = shlex.split(user_input)
@@ -216,13 +252,13 @@ class DBG:
 
             cmd_func(self, user_args)
 
-            if cmd_func._cmd_stop and self.is_debugging:
+            if cmd_func._cmd_stop_repl:
                 RUNNING_DBG.clear()
                 RUNNING_SCRIPT.set()
                 continue
 
     @staticmethod
-    def cmd(name: str, parser: ArgumentParser, alias: str | None = None, stop: bool = False):
+    def cmd(name: str, parser: ArgumentParser, alias: str | None = None, stop_repl: bool = False):
         parser.prog = name
         parser.add_help = True
         parser.exit_on_error = False
@@ -237,51 +273,71 @@ class DBG:
             func._cmd_name = name
             func._cmd_parse = parser.parse_args
             func._cmd_alias = alias
-            func._cmd_stop = stop
+            func._cmd_stop_repl = stop_repl
             return func
         return wrapper
 
+    # Meta commands
+
+    @cmd('run', ArgumentParser(), alias='r', stop_repl=True)
+    def _run(self, args):
+        self.flag_run = True
+
+    @cmd('restart', ArgumentParser(), stop_repl=True)
+    def _restart(self, args):
+        self.flag_restart = True
+
+    @cmd('quit', ArgumentParser(), alias='q', stop_repl=True)
+    def _quit(self, args):
+        self.flag_quit = True
+
+    # Moving commands
+
+    @cmd('step_over', ArgumentParser(), alias='s', stop_repl=True)
+    def _step_over(self, args):
+        self.thread_states[self.selected_tid].step_over()
+
+    @cmd('step_into', ArgumentParser(), alias='i', stop_repl=True)
+    def _step_into(self, args):
+        self.thread_states[self.selected_tid].step_into()
+
+    @cmd('step_out', ArgumentParser(), alias='o', stop_repl=True)
+    def _step_out(self, args):
+        self.thread_states[self.selected_tid].step_out()
+
+    @cmd('continue', ArgumentParser(), alias='c', stop_repl=True)
+    def _continue(self, args):
+        return
+
+    break_parser = ArgumentParser()
+    break_parser.add_argument('line', type=int)
+    @cmd('break', break_parser, alias='b')
+    def _break(self, args):
+        state = self.thread_states[self.selected_tid]
+        self.breakpoints.add(state.filename, args.line)
+
+    # Information commands
+
     thread_parser = ArgumentParser()
     thread_parser.add_argument('-l', '--list', action='store_true', help='List all active threads')
-
     @cmd('thread', thread_parser, alias='t')
     def _thread(self, args):
-        print(f'Current Thread:', threading.get_ident())
-        print(f'Selected Thread:', self.selected_tid)
+        msg = '\n'
+        msg += f'Current Thread: {threading.get_ident()}\n'
+        msg += f'Selected Thread: {self.selected_tid}'
         if args.list:
-            frames = sys._current_frames()
             for t in threading.enumerate():
-                print(f'- {t.name} ({t.ident}) [alive: {t.is_alive()}]')
+                msg += f'\n- {t.name} ({t.ident}) [alive: {t.is_alive()}]'
+        _logger.info(msg)
 
     @cmd('line', ArgumentParser(), alias='l')
     def _line(self, args):
+        if not self.selected_tid:
+            _logger.warning('No selected thread')
+            return
         code = self.thread_states[self.selected_tid]._frame.f_code
         line_number = self.thread_states[self.selected_tid]._frame.f_lineno
         filename = code.co_filename
         line = linecache.getline(filename, line_number).rstrip()
         if line:
-            print(f'<{filename}:{line_number}> -> {line}')
-
-    @cmd('step_over', ArgumentParser(), alias='s', stop=True)
-    def _step_over(self, args):
-        print('step over')
-        self.thread_states[self.selected_tid].step_over()
-
-    @cmd('step_into', ArgumentParser(), alias='i', stop=True)
-    def _step_into(self, args):
-        print('step into')
-        self.thread_states[self.selected_tid].step_into()
-
-    @cmd('step_out', ArgumentParser(), alias='o', stop=True)
-    def _step_out(self, args):
-        print('step out')
-        self.thread_states[self.selected_tid].step_out()
-
-    @cmd('continue', ArgumentParser(), alias='c', stop=True)
-    def _continue(self, args):
-        print('continue')
-
-    @cmd('quit', ArgumentParser(), alias='q', stop=True)
-    def _quit(self, args):
-        print('quit')
-        os._exit(0)
+            _logger.info(f'<{filename}:{line_number}> -> {line}')
