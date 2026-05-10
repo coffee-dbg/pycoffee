@@ -181,13 +181,6 @@ class DBG:
         with open(script_path, 'r') as file:
             code = compile(file.read(), script_path, 'exec')
 
-        globals_ = dict(
-            __name__='__main__',
-            __file__=str(script_path),
-            __builtins__=dict(__builtins__),
-            __spec__=None,
-        )
-
         sys.path[0] = str(script_path.parent)
         sys.argv[:] = script_args
 
@@ -201,6 +194,13 @@ class DBG:
         self.flag_quit = False
 
         while True:
+
+            globals_ = dict(
+                __name__='__main__',
+                __file__=str(script_path),
+                __builtins__=dict(__builtins__),
+                __spec__=None,
+            )
 
             # Opportunity to set configuration from debugger REPL
             while not self.flag_run:
