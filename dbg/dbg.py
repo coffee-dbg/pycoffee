@@ -7,6 +7,7 @@ import sys
 import threading
 from argparse import ArgumentError, ArgumentParser
 from collections import defaultdict
+from functools import cached_property
 from types import CodeType, FrameType
 from pathlib import Path
 
@@ -48,12 +49,10 @@ class Breakpoints:
 
 class ThreadState:
 
-    _frame: FrameType | None
-    _step_frame: FrameType | None
+    _current_frame: FrameType | None
+    _selected_frame: FrameType | None
 
     def __init__(self):
-        self._frame = None
-        self._lineno = None
         self._step_reset()
         self.step_over = lambda: self._step('over')
         self.step_into = lambda: self._step('into')
@@ -67,23 +66,71 @@ class ThreadState:
     def __repr__(self):
         return f'ThreadState(mode={self._step_mode}, frame={id(self._frame)}, step_frame={id(self._step_frame)})'
 
-    def update(self, frame: FrameType):
-        self._frame = frame
-        self._lineno = frame.f_lineno
+    # Context manager
+
+    def __call__(self, current_frame: FrameType):
+        self._current_frame = current_frame
+        return self
+
+    def __enter__(self):
+        self._selected_frame = self._current_frame
+        self._index = 0
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        del self._current_frame
+        del self._selected_frame
+        del self._index
+        self.__dict__.pop('stack', None)  # Cached property
+
+    # Selected frame information
 
     @property
-    def filename(self):
-        return self._frame.f_code.co_filename
+    def frame(self) -> FrameType:
+        return self._selected_frame
+
+    @property
+    def lineno(self) -> int:
+        return self.frame.f_lineno
+
+    @property
+    def filename(self) -> str:
+        return self.frame.f_code.co_filename
+
+    @cached_property
+    def stack(self) -> list[FrameType]:
+        frames = []
+        frame = self._current_frame
+        while frame:
+            frames.append(frame)
+            frame = frame.f_back
+        return frames
+
+    def select_parent(self):
+        self._index += 1
+        try:
+            self._selected_frame = self.stack[self._index]
+        except IndexError:
+            pass
+
+    def select_child(self):
+        self._index -= 1
+        try:
+            self._selected_frame = self.stack[self._index]
+        except IndexError:
+            pass
+
+    # Break management
 
     def _step(self, mode: str):
         self._step_mode = mode
-        self._step_frame = self._frame
-        self._step_lineno = self._lineno
+        self._step_frame = self.frame
+        self._step_lineno = self.lineno
 
     def _is_step_ancestor(self) -> bool:
         f = self._step_frame.f_back
         while f:
-            if f is self._frame:
+            if f is self.frame:
                 return True
             f = f.f_back
         return False
@@ -92,10 +139,10 @@ class ThreadState:
         stop = False
         match self._step_mode:
             case 'over':
-                if (self._frame is self._step_frame and self._lineno != self._step_lineno) or self._is_step_ancestor():
+                if (self.frame is self._step_frame and self.lineno != self._step_lineno) or self._is_step_ancestor():
                     stop = True
             case 'into':
-                if self._frame is not self._step_frame or self._lineno != self._step_lineno:
+                if self.frame is not self._step_frame or self.lineno != self._step_lineno:
                     stop = True
             case 'out':
                 if self._is_step_ancestor():
@@ -202,28 +249,28 @@ class DBG:
         if (tid == self.dbg_tid): return
 
         state = self.thread_states[tid]
-        state.update(sys._getframe(1))
 
-        RUNNING_SCRIPT.wait()  # Wait after update
+        with state(sys._getframe(1)):
+            RUNNING_SCRIPT.wait()  # Wait after snapshot
 
-        # Check break
-        if (
-            (breakpoint := self.breakpoints.get(code.co_filename, line_number)) is not None
-            or state.must_break()
-        ):
+            # Check break
+            if (
+                (breakpoint := self.breakpoints.get(code.co_filename, line_number)) is not None
+                or state.must_break()
+            ):
 
-            self.selected_tid = tid
-            RUNNING_SCRIPT.clear()
-            RUNNING_DBG.set()
-            RUNNING_SCRIPT.wait()  # To prevent next line of the debugged thread
+                self.selected_tid = tid
+                RUNNING_SCRIPT.clear()
+                RUNNING_DBG.set()
+                RUNNING_SCRIPT.wait()  # To prevent next line of the debugged thread
 
-            # Check flags
-            if self.flag_restart:
-                self.flag_restart = False
-                raise _RestartException
-            if self.flag_quit:
-                self.flag_quit = False
-                raise _QuitException
+                # Check flags
+                if self.flag_restart:
+                    self.flag_restart = False
+                    raise _RestartException
+                if self.flag_quit:
+                    self.flag_quit = False
+                    raise _QuitException
 
     def repl(self):
         self.dbg_tid = threading.get_ident()
@@ -291,7 +338,7 @@ class DBG:
     def _quit(self, args):
         self.flag_quit = True
 
-    # Moving commands
+    # Execution flow commands
 
     @cmd('step_over', ArgumentParser(), alias='s', stop_repl=True)
     def _step_over(self, args):
@@ -330,13 +377,30 @@ class DBG:
                 msg += f'\n- {t.name} ({t.ident}) [alive: {t.is_alive()}]'
         _logger.info(msg)
 
+    stack_parser = ArgumentParser()
+    stack_parser.add_argument('-l', '--list', action='store_true', help='Display call stack')
+    stack_parser.add_argument('-u', '--up', action='store_true', help='Go to parent frame')
+    stack_parser.add_argument('-d', '--down', action='store_true', help='Go to child frame')
+    @cmd('stack', stack_parser)
+    def _stack(self, args):
+        state = self.thread_states[self.selected_tid]
+        if args.list:
+            msg = ''
+            for frame in state.stack:
+                msg += f'\n- {frame.f_code.co_name}'
+            _logger.info(msg)
+        if args.up:
+            state.select_parent()
+        if args.down:
+            state.select_child()
+
     @cmd('line', ArgumentParser(), alias='l')
     def _line(self, args):
         if not self.selected_tid:
             _logger.warning('No selected thread')
             return
-        code = self.thread_states[self.selected_tid]._frame.f_code
-        line_number = self.thread_states[self.selected_tid]._frame.f_lineno
+        code = self.thread_states[self.selected_tid].frame.f_code
+        line_number = self.thread_states[self.selected_tid].frame.f_lineno
         filename = code.co_filename
         line = linecache.getline(filename, line_number).rstrip()
         if line:
